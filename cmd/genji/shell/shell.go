@@ -37,6 +37,8 @@ type Shell struct {
 	history []string
 
 	cmdSuggestions []prompt.Suggest
+
+	cancel func()
 }
 
 // Options of the shell.
@@ -77,7 +79,7 @@ func stdinFromTerminal() bool {
 }
 
 // Run a shell.
-func Run(opts *Options) error {
+func Run(ctx context.Context, opts *Options) error {
 	if opts == nil {
 		opts = new(Options)
 	}
@@ -90,6 +92,10 @@ func Run(opts *Options) error {
 	var sh Shell
 
 	sh.opts = opts
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	sh.cancel = cancel
 
 	if stdinFromTerminal() {
 		switch opts.Engine {
@@ -147,13 +153,22 @@ func Run(opts *Options) error {
 		}
 	}
 
-	e := prompt.New(
-		sh.execute,
-		sh.completer,
-		promptOpts...,
-	)
+LOOP:
+	for {
+		select {
+		case <-ctx.Done():
+			break LOOP
+		default:
+		}
 
-	e.Run()
+		input := prompt.Input(
+			"genji> ",
+			sh.completer,
+			promptOpts...,
+		)
+
+		sh.execute(input)
+	}
 
 	if sh.db != nil {
 		err = sh.db.Close()
@@ -289,7 +304,8 @@ func (sh *Shell) runCommand(in string) error {
 			return fmt.Errorf("usage: .exit")
 		}
 
-		sh.exit()
+		sh.cancel()
+		return nil
 	case ".indexes":
 		db, err := sh.getDB()
 		if err != nil {
@@ -306,8 +322,6 @@ func (sh *Shell) runCommand(in string) error {
 	default:
 		return displaySuggestions(in)
 	}
-
-	return fmt.Errorf("unknown command %q", cmd)
 }
 
 func (sh *Shell) runQuery(q string) error {
@@ -329,22 +343,6 @@ func (sh *Shell) runQuery(q string) error {
 	return res.Iterate(func(d document.Document) error {
 		return enc.Encode(d)
 	})
-}
-
-func (sh *Shell) exit() {
-	if sh.db != nil {
-		err := sh.db.Close()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		}
-	}
-
-	err := sh.dumpHistory()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-	}
-
-	os.Exit(0)
 }
 
 func (sh *Shell) getDB() (*genji.DB, error) {
