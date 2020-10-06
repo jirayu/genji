@@ -1,14 +1,15 @@
 package shell
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
-	"path/filepath"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/c-bata/go-prompt"
 	"github.com/dgraph-io/badger/v2"
@@ -38,7 +39,8 @@ type Shell struct {
 
 	cmdSuggestions []prompt.Suggest
 
-	cancel func()
+	interruptC chan os.Signal
+	cancel     func()
 }
 
 // Options of the shell.
@@ -93,6 +95,9 @@ func Run(ctx context.Context, opts *Options) error {
 
 	sh.opts = opts
 
+	sh.interruptC = make(chan os.Signal, 1)
+	signal.Notify(sh.interruptC, os.Interrupt, syscall.SIGTERM)
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	sh.cancel = cancel
@@ -115,7 +120,7 @@ func Run(ctx context.Context, opts *Options) error {
 		return err
 	}
 
-	ran, err := sh.runPipedInput()
+	ran, err := sh.runPipedInput(ctx)
 	if err != nil {
 		return err
 	}
@@ -127,7 +132,16 @@ func Run(ctx context.Context, opts *Options) error {
 		prompt.OptionPrefix("genji> "),
 		prompt.OptionTitle("genji"),
 		prompt.OptionLivePrefix(sh.changelivePrefix),
-		prompt.OptionHistory(history),
+		prompt.OptionAddKeyBind(prompt.KeyBind{
+			Key: prompt.ControlC,
+			Fn: func(buf *prompt.Buffer) {
+				sh.interruptC <- os.Interrupt
+			},
+		}),
+		prompt.OptionSetExitCheckerOnInput(func(in string, breakline bool) bool {
+			fmt.Printf("Exit checker: %q, %v\n", in, breakline)
+			return breakline || len(in) == 0
+		}),
 	}
 
 	// If NO_COLOR env var is present, disable color. See https://no-color.org
@@ -153,21 +167,37 @@ func Run(ctx context.Context, opts *Options) error {
 		}
 	}
 
+	p := &prompt.Prompt{}
+	
+
 LOOP:
 	for {
 		select {
+		case <-sh.interruptC:
+			fmt.Println("ICIII")
+			break LOOP
 		case <-ctx.Done():
 			break LOOP
 		default:
 		}
 
+		opts := append(promptOpts, prompt.OptionHistory(history))
+
 		input := prompt.Input(
 			"genji> ",
 			sh.completer,
-			promptOpts...,
+			opts...,
 		)
 
-		sh.execute(input)
+		fmt.Println("Input:", input)
+		input = strings.TrimSpace(input)
+
+		if len(input) == 0 {
+			continue
+		}
+
+		history = append(history, input)
+		sh.execute(ctx, input)
 	}
 
 	if sh.db != nil {
@@ -188,87 +218,27 @@ func (sh *Shell) loadCommandSuggestions() {
 	sh.cmdSuggestions = suggestions
 }
 
-func (sh *Shell) loadHistory() ([]string, error) {
-	if _, ok := os.LookupEnv("NO_HISTORY"); ok {
-		return nil, nil
-	}
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return nil, err
-	}
-
-	fname := filepath.Join(homeDir, historyFilename)
-
-	_, err = os.Stat(fname)
-	if err != nil {
-		return nil, nil
-	}
-
-	f, err := os.Open(fname)
-	if err != nil {
-		return nil, nil
-	}
-	defer f.Close()
-
-	var history []string
-	s := bufio.NewScanner(f)
-	for s.Scan() {
-		history = append(history, s.Text())
-	}
-
-	return history, s.Err()
-}
-
-func (sh *Shell) dumpHistory() error {
-	if _, ok := os.LookupEnv("NO_HISTORY"); ok {
-		return nil
-	}
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return err
-	}
-
-	fname := filepath.Join(homeDir, historyFilename)
-
-	f, err := os.OpenFile(fname, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	w := bufio.NewWriter(f)
-	for _, h := range sh.history {
-		_, err = w.WriteString(h + "\n")
-		if err != nil {
-			return err
-		}
-	}
-
-	return w.Flush()
-}
-
-func (sh *Shell) execute(in string) {
+func (sh *Shell) execute(ctx context.Context, in string) {
 	sh.history = append(sh.history, in)
 
-	err := sh.executeInput(in)
-	if err != nil {
-		fmt.Println(err)
+	err := sh.executeInput(ctx, in)
+	if err != nil && err != context.Canceled {
+		fmt.Fprintln(os.Stderr, err)
 	}
 }
 
-func (sh *Shell) executeInput(in string) error {
-	in = strings.TrimSpace(in)
+func (sh *Shell) executeInput(ctx context.Context, in string) error {
 	switch {
 	// if it starts with a "." it's a command
 	// it must not be in the middle of a multi line query though
 	case strings.HasPrefix(in, "."):
-		return sh.runCommand(in)
+		return sh.runCommand(ctx, in)
 	// If it ends with a ";" we can run a query
 	case strings.HasSuffix(in, ";"):
 		sh.query = sh.query + in
 		sh.multiLine = false
 		sh.livePrefix = in
-		err := sh.runQuery(sh.query)
+		err := sh.runQuery(ctx, sh.query)
 		sh.query = ""
 		return err
 	// If the input is empty we ignore it
@@ -286,7 +256,7 @@ func (sh *Shell) executeInput(in string) error {
 	return nil
 }
 
-func (sh *Shell) runCommand(in string) error {
+func (sh *Shell) runCommand(ctx context.Context, in string) error {
 	in = strings.TrimSuffix(in, ";")
 	cmd := strings.Fields(in)
 	switch cmd[0] {
@@ -324,13 +294,13 @@ func (sh *Shell) runCommand(in string) error {
 	}
 }
 
-func (sh *Shell) runQuery(q string) error {
+func (sh *Shell) runQuery(ctx context.Context, q string) error {
 	db, err := sh.getDB()
 	if err != nil {
 		return err
 	}
 
-	res, err := db.Query(context.Background(), q)
+	res, err := db.Query(ctx, q)
 	if err != nil {
 		return err
 	}
@@ -341,6 +311,12 @@ func (sh *Shell) runQuery(q string) error {
 	enc.SetEscapeHTML(false)
 	enc.SetIndent("", "  ")
 	return res.Iterate(func(d document.Document) error {
+		select {
+		case <-sh.interruptC:
+			return errors.New("interrupted")
+		default:
+		}
+
 		return enc.Encode(d)
 	})
 }
@@ -375,7 +351,7 @@ func (sh *Shell) getDB() (*genji.DB, error) {
 	return sh.db, nil
 }
 
-func (sh *Shell) runPipedInput() (ran bool, err error) {
+func (sh *Shell) runPipedInput(ctx context.Context) (ran bool, err error) {
 	// Check if there is any input being piped in from the terminal
 	stat, _ := os.Stdin.Stat()
 	m := stat.Mode()
@@ -387,7 +363,7 @@ func (sh *Shell) runPipedInput() (ran bool, err error) {
 	if err != nil {
 		return true, fmt.Errorf("Unable to read piped input: %w", err)
 	}
-	err = sh.runQuery(string(data))
+	err = sh.runQuery(ctx, string(data))
 	if err != nil {
 		return true, fmt.Errorf("Unable to execute provided sql statements: %w", err)
 	}
